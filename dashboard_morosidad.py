@@ -17,6 +17,54 @@ from io import BytesIO
 import tempfile
 import os
 warnings.filterwarnings('ignore')
+from datetime import timedelta
+
+# =============================================
+# 1. SECCIÓN DE AUTENTICACIÓN (AL PRINCIPIO DEL ARCHIVO)
+# =============================================
+
+# Configuración de usuarios y contraseñas
+USUARIOS = {
+    "master": "idemefa2585",
+    "cxc": "idemefa2025"
+}
+
+def check_auth():
+    """Verifica si el usuario está autenticado"""
+    return st.session_state.get("autenticado", False)
+
+def login():
+    """Muestra el formulario de login"""
+    st.title("🔐 Acceso al Dashboard")
+    with st.form("login_form"):
+        usuario = st.text_input("Usuario")
+        password = st.text_input("Contraseña", type="password")
+        submit = st.form_submit_button("Ingresar")
+        
+        if submit:
+            if usuario in USUARIOS and USUARIOS[usuario] == password:
+                st.session_state["autenticado"] = True
+                st.session_state["usuario"] = usuario
+                st.rerun()  # Recarga la app para mostrar el dashboard
+            else:
+                st.error("❌ Usuario o contraseña incorrectos")
+
+def logout():
+    """Cierra la sesión del usuario"""
+    st.session_state["autenticado"] = False
+    st.session_state["usuario"] = None
+    st.rerun()
+
+# =============================================
+# 2. VERIFICACIÓN DE AUTENTICACIÓN (ANTES DEL DASHBOARD)
+# =============================================
+if not check_auth():
+    login()
+    st.stop()  # Detiene la ejecución si no está autenticado
+
+# =============================================
+# 3. EL RESTO DE TU DASHBOARD (CONTENIDO PROTEGIDO)
+# =============================================
 
 # =============================================
 # CONFIGURACIÓN DE LA PÁGINA
@@ -198,13 +246,14 @@ st.markdown("""
 """)
 
 # Crear pestañas
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📌 Resumen Ejecutivo", 
     "🔍 Análisis de Morosidad",
     "🔮 Predicción de Riesgo",
     "👤 Perfil de Cliente",
     "🧩 Segmentación",
-    "🧮 Simulador"
+    "🧮 Simulador",
+    "💵 Cumplimiento y Meta de Cobros"
 ])
 
 # =============================================
@@ -1130,6 +1179,236 @@ with tab6:
             st.metric("Monto Total Pagado", format_currency(monto_total))
 
 # =============================================
+# PESTAÑA 7: CUMPLIMIENTO Y META DE COBROS
+# =============================================
+
+with tab7:
+    st.header("💵 Cumplimiento y Meta de Cobros", divider="blue")
+
+    # =======================
+    # LISTA DE SEMANAS
+    # =======================
+    hoy = pd.Timestamp.today().normalize()
+    fechas_semana = pd.date_range(
+        start=hoy - timedelta(weeks=3),
+        end=hoy + timedelta(weeks=6),
+        freq='W-MON'
+    )
+
+    semanas_unicas = pd.DataFrame({'fecha_min': fechas_semana})
+    semanas_unicas['fecha_max'] = semanas_unicas['fecha_min'] + timedelta(days=6)
+    semanas_unicas['Año'] = semanas_unicas['fecha_min'].dt.year
+    semanas_unicas['Semana'] = semanas_unicas['fecha_min'].dt.isocalendar().week
+    semanas_unicas['Etiqueta'] = semanas_unicas.apply(
+        lambda row: f"Semana {row['Semana']} ({row['fecha_min'].strftime('%d/%m/%Y')} - {row['fecha_max'].strftime('%d/%m/%Y')})",
+        axis=1
+    )
+
+    semana_sel = st.selectbox("📅 Seleccionar semana objetivo para cobro", options=semanas_unicas['Etiqueta'])
+    semana_data = semanas_unicas[semanas_unicas['Etiqueta'] == semana_sel].iloc[0]
+    fecha_ini_semana = semana_data['fecha_min']
+    fecha_fin_semana = semana_data['fecha_max']
+    es_futura = fecha_ini_semana > hoy
+    st.info(f"📌 Semana seleccionada: {semana_sel}")
+
+    # =======================
+    # META SEMANAL
+    # =======================
+    meta_semanal = st.number_input(
+        "🎯 Meta de cobro semanal",
+        min_value=1_200_000.0,
+        max_value=1_600_000.0,
+        value=1_400_000.0,
+        step=50_000.0
+    )
+
+    # =======================
+    # INCLUIR ATRASADOS OPCIONAL
+    # =======================
+    incluir_atrasados = st.checkbox("📌 Incluir clientes con facturas vencidas de semanas anteriores", value=True)
+
+    if incluir_atrasados:
+        estado_cuenta_plan = estado_cuenta[estado_cuenta['Fecha_fatura'] <= fecha_fin_semana].copy()
+    else:
+        estado_cuenta_plan = estado_cuenta[
+            (estado_cuenta['Fecha_fatura'] >= fecha_ini_semana) &
+            (estado_cuenta['Fecha_fatura'] <= fecha_fin_semana)
+        ].copy()
+
+    # =======================
+    # HISTORIAL DE PAGO NORMALIZADO
+    # =======================
+    historial_pago = (
+        comportamiento_pago.groupby("Codigo")["Pagado"]
+        .mean()
+        .reset_index()
+        .rename(columns={"Pagado": "HistorialPago"})
+    )
+    max_hist = historial_pago["HistorialPago"].max() or 1
+    historial_pago["HistorialPago_Normalizado"] = historial_pago["HistorialPago"] / max_hist
+
+    # =======================
+    # CALCULAR SCORE DE COBRO
+    # =======================
+    df_plan = (
+        estado_cuenta_plan.groupby(["Codigo", "Nombre Cliente"])
+        .agg({
+            "Balance": "sum",
+            "Probabilidad_Morosidad": "mean"
+        })
+        .reset_index()
+    )
+
+    max_balance = df_plan["Balance"].max() or 1
+    df_plan["Balance_Normalizado"] = df_plan["Balance"] / max_balance
+    df_plan = df_plan.merge(historial_pago[["Codigo", "HistorialPago_Normalizado"]], on="Codigo", how="left")
+    df_plan["HistorialPago_Normalizado"] = df_plan["HistorialPago_Normalizado"].fillna(0.5)
+
+    df_plan["Score_Cobro"] = (
+        0.5 * (1 - df_plan["Probabilidad_Morosidad"]) +
+        0.3 * df_plan["HistorialPago_Normalizado"] +
+        0.2 * df_plan["Balance_Normalizado"]
+    )
+
+    # =======================
+    # SELECCIÓN DE CLIENTES HASTA META APROXIMADA
+    # =======================
+    df_plan = df_plan.sort_values("Score_Cobro", ascending=False).reset_index(drop=True)
+    df_plan["Monto_Acumulado"] = df_plan["Balance"].cumsum()
+
+    df_seleccion = pd.DataFrame(columns=df_plan.columns)
+    acumulado = 0.0
+
+    for i, row in df_plan.iterrows():
+        if acumulado >= meta_semanal:
+            break
+        df_seleccion = pd.concat([df_seleccion, pd.DataFrame([row])], ignore_index=True)
+        acumulado += row["Balance"]
+
+    # =======================
+    # ESTADO DE CUMPLIMIENTO
+    # =======================
+    if es_futura:
+        df_seleccion["Monto_Pagado"] = 0
+        df_seleccion["Estado_Cumplimiento"] = "📅 Planificado"
+        monto_cobrado_semana = 0
+        cumplimiento_semana = 0
+    else:
+        pagos_semana = comportamiento_pago[
+            (comportamiento_pago["Fecha_fatura"] >= fecha_ini_semana) &
+            (comportamiento_pago["Fecha_fatura"] <= fecha_fin_semana)
+        ].groupby("Codigo")["Pagado"].sum().reset_index()
+
+        df_seleccion = df_seleccion.merge(pagos_semana, on="Codigo", how="left").rename(columns={"Pagado": "Monto_Pagado"})
+        df_seleccion["Monto_Pagado"] = df_seleccion["Monto_Pagado"].fillna(0)
+        df_seleccion["Estado_Cumplimiento"] = df_seleccion["Monto_Pagado"].apply(lambda x: "Pagó" if x > 0 else "Planificado - No cumplió")
+
+        monto_cobrado_semana = pagos_semana["Pagado"].sum()
+        cumplimiento_semana = monto_cobrado_semana / meta_semanal if meta_semanal > 0 else 0
+
+    # =======================
+    # KPI SEMANAL
+    # =======================
+    monto_planificado = df_seleccion["Balance"].sum()
+    col1, col2, col3 = st.columns(3)
+    col1.metric("🎯 Meta semanal", f"${meta_semanal:,.2f}")
+    col2.metric("📋 Planificado", f"${monto_planificado:,.2f}")
+    col3.metric("✅ Cobrado", f"${monto_cobrado_semana:,.2f}", f"{cumplimiento_semana:.1%}" if not es_futura else "📅 Planificado")
+
+    # =======================
+    # KPI MENSUAL
+    # =======================
+    mes_actual = fecha_ini_semana.month
+    año_actual = fecha_ini_semana.year
+    monto_cobrado_mes = comportamiento_pago[
+        (comportamiento_pago["Fecha_fatura"].dt.month == mes_actual) &
+        (comportamiento_pago["Fecha_fatura"].dt.year == año_actual)
+    ]["Pagado"].sum()
+    meta_mensual = meta_semanal * 4
+    cumplimiento_mes = monto_cobrado_mes / meta_mensual if meta_mensual > 0 else 0
+    st.markdown("### 📊 Indicador Global Mensual")
+    colm1, colm2, colm3 = st.columns(3)
+    colm1.metric("🎯 Meta mensual", f"${meta_mensual:,.2f}")
+    colm2.metric("💰 Cobrado mes", f"${monto_cobrado_mes:,.2f}")
+    colm3.metric("📈 Cumplimiento mes", f"{cumplimiento_mes:.1%}")
+
+    # =======================
+    # TABLA PLANIFICADOS
+    # =======================
+    st.subheader("📋 Clientes planificados para cobro")
+    st.dataframe(
+        df_seleccion.assign(
+            Balance=lambda x: x["Balance"].apply(lambda v: f"${v:,.2f}"),
+            Probabilidad_Morosidad=lambda x: x["Probabilidad_Morosidad"].apply(lambda v: f"{v:.1%}"),
+            HistorialPago_Normalizado=lambda x: x["HistorialPago_Normalizado"].apply(lambda v: f"{v:.2f}"),
+            Balance_Normalizado=lambda x: x["Balance_Normalizado"].apply(lambda v: f"{v:.2f}"),
+            Score_Cobro=lambda x: x["Score_Cobro"].apply(lambda v: f"{v:.2f}"),
+            Monto_Pagado=lambda x: x["Monto_Pagado"].apply(lambda v: f"${v:,.2f}")
+        ),
+        hide_index=True,
+        use_container_width=True
+    )
+
+    # =======================
+    # CLIENTES FUERA DE PLANIFICACIÓN QUE PAGARON
+    # =======================
+    if not es_futura:
+        clientes_planificados = set(df_seleccion["Codigo"].unique())
+        pagos_semana = comportamiento_pago[
+            (comportamiento_pago["Fecha_fatura"] >= fecha_ini_semana) &
+            (comportamiento_pago["Fecha_fatura"] <= fecha_fin_semana)
+        ]
+        pagos_fuera_plan = pagos_semana[~pagos_semana["Codigo"].isin(clientes_planificados)].copy()
+
+        if not pagos_fuera_plan.empty:
+            pagos_fuera_plan = pagos_fuera_plan.groupby("Codigo")["Pagado"].sum().reset_index()
+            pagos_fuera_plan = pagos_fuera_plan.merge(
+                estado_cuenta[["Codigo", "Nombre Cliente", "Probabilidad_Morosidad"]].drop_duplicates(),
+                on="Codigo",
+                how="left"
+            )
+            st.subheader("💵 Clientes fuera de planificación que pagaron")
+            st.dataframe(
+                pagos_fuera_plan.assign(
+                    Pagado=lambda x: x["Pagado"].apply(lambda v: f"${v:,.2f}"),
+                    Probabilidad_Morosidad=lambda x: x["Probabilidad_Morosidad"].apply(lambda v: f"{v:.1%}")
+                ).rename(columns={"Pagado": "Monto Pagado", "Probabilidad_Morosidad": "Riesgo"}),
+                hide_index=True,
+                use_container_width=True
+            )
+        else:
+            st.info("No hubo pagos fuera de la planificación en esta semana.")
+
+    # =======================
+    # EXPORTACIÓN PLANIFICACIÓN
+    # =======================
+    csv_export = df_seleccion.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="📥 Descargar plan semanal (CSV)",
+        data=csv_export,
+        file_name=f"plan_cobros_{semana_sel.replace(' ', '_')}.csv",
+        mime="text/csv"
+    )
+
+    # =======================
+    # MÉTODO EXPLICADO
+    # =======================
+    st.markdown("""
+    ---
+    **🧮 Método de priorización utilizado**  
+    Los clientes se priorizan en base a un **score de cobro** calculado como:
+
+    **Score = (0.5 × (1 - Probabilidad de Morosidad)) + (0.3 × Historial de Pago Normalizado) + (0.2 × Balance Normalizado)**  
+
+    - **Probabilidad de Morosidad**: estimada por el modelo de riesgo crediticio.
+    - **Historial de Pago Normalizado**: promedio histórico de pagos comparado con el mayor de todos los clientes.
+    - **Balance Normalizado**: saldo pendiente comparado con el saldo máximo en la cartera.
+
+    El estado de cada cliente se determina según si **pagó** en la semana seleccionada o si fue **planificado - no cumplió**.
+    """)
+
+
+# =============================================
 # FILTROS GLOBALES (sidebar)
 # =============================================
 with st.sidebar:
@@ -1186,5 +1465,5 @@ with st.sidebar:
 st.sidebar.markdown("---")
 st.sidebar.info("""
     **Dashboard cxc IDEMEFA**  
-    Versión 2.0 - Junio 2024
+    Versión 2.0 - Junio 2025
 """)
